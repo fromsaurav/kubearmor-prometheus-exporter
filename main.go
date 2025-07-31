@@ -5,15 +5,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"io"
 	"log"
 	"net/http"
+	"path/filepath"
 	"sync"
 
 	pb "github.com/kubearmor/KubeArmor/protobuf"
+	"github.com/kubearmor/kubearmor-prometheus-exporter/pkg/policy"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 var (
@@ -70,6 +75,24 @@ totalAlertsWithAction = prometheus.NewCounterVec(
 		Name: "kubearmor_alerts_with_action_total",
 		Help: "Total number of alerts based on Action",
 	}, []string{"Action"})
+
+totalPolicies = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "kubearmor_policies_total",
+		Help: "Total number of KubeArmor policies by type",
+	}, []string{"type"})
+
+policyInfo = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "kubearmor_policy_info",
+		Help: "Information about KubeArmor policies",
+	}, []string{"name", "namespace", "type", "status"})
+
+policiesByNamespace = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "kubearmor_policies_by_namespace_total",
+		Help: "Total number of KubeArmor policies by namespace and type",
+	}, []string{"namespace", "type"})
 )
 
 func init() {
@@ -83,6 +106,21 @@ func init() {
 	prometheus.MustRegister(totalAlertsWithType)
 	prometheus.MustRegister(totalAlertsWithOperation)
 	prometheus.MustRegister(totalAlertsWithAction)
+
+	prometheus.MustRegister(totalPolicies)
+	prometheus.MustRegister(policyInfo)
+	prometheus.MustRegister(policiesByNamespace)
+	
+	initializePolicyMetrics()
+}
+
+func initializePolicyMetrics() {
+	totalPolicies.WithLabelValues("KubeArmorPolicy").Set(0)
+	totalPolicies.WithLabelValues("KubeArmorHostPolicy").Set(0)
+	totalPolicies.WithLabelValues("KubeArmorClusterPolicy").Set(0)
+	
+	policyInfo.WithLabelValues("example-policy", "default", "KubeArmorPolicy", "active").Set(0)
+	policiesByNamespace.WithLabelValues("default", "KubeArmorPolicy").Set(0)
 }
 
 
@@ -100,6 +138,8 @@ func GetPrometheusAlerts(wg *sync.WaitGroup, gRPCAddr string) {
 	stream, err := client.WatchAlerts(context.Background(), req)
 	if err != nil {
 		fmt.Printf("Failed to call WatchAlerts() (%s)\n", err.Error())
+		wg.Done()
+		return
 	}
 
 	for {
@@ -107,16 +147,6 @@ func GetPrometheusAlerts(wg *sync.WaitGroup, gRPCAddr string) {
 		if err != nil {
 			fmt.Printf("Failed to receive any alerts (%s)\n", err.Error())
 			break
-		}
-
-		switch err {
-		case io.EOF:
-			fmt.Println(err.Error())
-			break
-		case nil:
-			//
-		default:
-			fmt.Println(err.Error())
 		}
 
 		// fmt.Println(alertIn)
@@ -136,12 +166,36 @@ func GetPrometheusAlerts(wg *sync.WaitGroup, gRPCAddr string) {
 	wg.Done()
 }
 
+func createKubeClient() (kubernetes.Interface, dynamic.Interface, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		config, err = clientcmd.BuildConfigFromFlags("",
+			filepath.Join(os.Getenv("HOME"), ".kube", "config"))
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return clientset, dynamicClient, nil
+}
+
 func main() {
 	var wg sync.WaitGroup
 
 	// == //
 
 	gRPCPtr := flag.String("gRPC", "", "gRPC server information")
+	disablePolicyWatcher := flag.Bool("disable-policy-watcher", false, "Disable policy watcher for development")
 	flag.Parse()
 
 	// == //
@@ -163,7 +217,21 @@ func main() {
 	wg.Add(1)
 	go GetPrometheusAlerts(&wg, gRPCAddr)
 
+	if !*disablePolicyWatcher {
+		clientset, dynamicClient, err := createKubeClient()
+		if err != nil {
+			log.Printf("Warning: Failed to create Kubernetes client: %v. Policy metrics will not be available.", err)
+		} else {
+			policyWatcher := policy.NewPolicyWatcher(clientset, dynamicClient)
+			if err := policyWatcher.Start(); err != nil {
+				log.Printf("Warning: Failed to start policy watcher: %v", err)
+			}
+			defer policyWatcher.Stop()
+		}
+	}
+
 	http.Handle("/metrics", promhttp.Handler())
+	log.Println("Starting Prometheus exporter on :9100")
 	log.Fatal(http.ListenAndServe(":9100", nil))
 
 	wg.Wait()

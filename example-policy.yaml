@@ -1,0 +1,65 @@
+apiVersion: security.kubearmor.com/v1
+kind: KubeArmorPolicy
+metadata:
+  name: example-deny-process-policy
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  process:
+    matchPaths:
+    - path: /bin/bash
+      action: Block
+    - path: /usr/bin/wget
+      action: Block
+  file:
+    matchPaths:
+    - path: /etc/passwd
+      action: Block
+  network:
+    matchProtocols:
+    - protocol: tcp
+      fromSource:
+      - path: /usr/bin/curl
+      action: Block
+  action: Block
+---
+apiVersion: security.kubearmor.com/v1
+kind: KubeArmorPolicy
+metadata:
+  name: example-allow-policy
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: test-app
+  process:
+    matchPaths:
+    - path: /usr/bin/python3
+      action: Allow
+  file:
+    matchDirectories:
+    - dir: /tmp/
+      action: Allow
+  action: Allow
+---
+apiVersion: security.kubearmor.com/v1
+kind: KubeArmorHostPolicy
+metadata:
+  name: example-host-policy
+spec:
+  nodeSelector:
+    matchLabels:
+      kubernetes.io/os: linux
+  process:
+    matchPaths:
+    - path: /usr/bin/apt
+      action: Block
+    - path: /usr/bin/yum
+      action: Block
+  file:
+    matchPaths:
+    - path: /etc/shadow
+      action: Block
+  action: Block
